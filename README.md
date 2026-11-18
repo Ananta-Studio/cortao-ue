@@ -112,7 +112,7 @@ The plugin is source only; your project must be a C++ project (or you must be ab
 
    ```
    cd <YourProject>/Plugins
-   git clone <this repository's URL> CORTAO
+   git clone https://github.com/Ananta-Studio/cortao-ue.git CORTAO
    ```
 
 2. Enable it: add it to your `.uproject`, or tick **CORTAO Ambient Occlusion** in Edit > Plugins (category
