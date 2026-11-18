@@ -1,0 +1,95 @@
+// CORTAO for Unreal Engine. Copyright (c) 2026 Ananta Studio. MIT License, see LICENSE.
+// What the CORTAO passes share. The CORTAO headers in ThirdParty/ are Daniel Isheden's (MIT, see
+// ThirdParty/LICENSE-CORTAO.txt) with this port's few changes marked UE PORT; everything engine-specific
+// is in these files.
+//
+// CORTAO's view space is right-handed and looks down -Z (OpenGL's). The engine's is left-handed and
+// looks down +Z, so a view vector crosses over as (x, y, -z). Texture coordinates run top-down in both
+// once the projection constants are built for it (CORTAORendering.cpp).
+
+#pragma once
+
+#include "/Engine/Private/Common.ush"
+
+Texture2D GBufferATexture;
+Texture2D<float> SceneDepthTexture;
+uint2 ViewRectMin;
+
+/** 1: normals rebuilt from the depth buffer (the geometry's own), 0: the GBuffer's (normal maps included). */
+uint UseDepthNormals;
+
+/**
+ * The foliage flag: the lowest depth bit kept above CORTAO's packed normal (CORTAO_PACKED_NORMAL_BITS = 10),
+ * set by the prepass for Two Sided Foliage pixels and for pixels on the foliage lighting channel. It rides along every
+ * mip, so the main pass knows whether an OCCLUDER sample is a leaf or a blade; the depth error is one ulp of 13 bits.
+ */
+#define CORTAO_FOLIAGE_BIT (1u << 10)
+#define CORTAO_SHADINGMODELID_TWOSIDED_FOLIAGE 6   // ShadingCommon.ush
+
+bool CORTAOIsFoliage(uint Packed)
+{
+	return (Packed & CORTAO_FOLIAGE_BIT) != 0u;
+}
+
+/** A BUFFER pixel's position relative to the camera (translated world), from the depth buffer. */
+float3 CORTAOTranslatedPosition(int2 BufferPos)
+{
+	const float DeviceZ = SceneDepthTexture.Load(int3(BufferPos, 0));
+	return SvPositionToTranslatedWorld(float4(float2(BufferPos) + 0.5f, max(DeviceZ, 1e-10f), 1.0f));
+}
+
+/**
+ * The geometric normal from depth (against the specks GBuffer normals leave on flat, normal-mapped walls):
+ * on each axis the neighbour whose depth is closer to the centre's, so an edge does not bend the normal of the
+ * surface it bounds. In world space, facing the camera.
+ */
+float3 CORTAODepthWorldNormal(int2 BufferPos)
+{
+	const float3 C = CORTAOTranslatedPosition(BufferPos);
+	const float3 L = CORTAOTranslatedPosition(BufferPos - int2(1, 0));
+	const float3 R = CORTAOTranslatedPosition(BufferPos + int2(1, 0));
+	const float3 U = CORTAOTranslatedPosition(BufferPos - int2(0, 1));
+	const float3 D = CORTAOTranslatedPosition(BufferPos + int2(0, 1));
+
+	const float DistC = length(C);
+	const float3 DX = abs(length(R) - DistC) < abs(length(L) - DistC) ? R - C : C - L;
+	const float3 DY = abs(length(D) - DistC) < abs(length(U) - DistC) ? D - C : C - U;
+
+	float3 N = cross(DY, DX);
+	const float LengthSquared = dot(N, N);
+	if (LengthSquared < 1e-12f)
+	{
+		return -normalize(C);
+	}
+	N *= rsqrt(LengthSquared);
+	// The camera is the translated world's origin: the normal must point back at it.
+	return dot(N, C) > 0.0f ? -N : N;
+}
+
+/** The geometric normal from depth at a BUFFER pixel, in CORTAO's view space. */
+float3 CORTAODepthViewNormal(uint2 BufferPos)
+{
+	const float3 ViewNormal = mul(CORTAODepthWorldNormal(int2(BufferPos)), (float3x3)View.TranslatedWorldToView);
+	return normalize(float3(ViewNormal.x, ViewNormal.y, -ViewNormal.z));
+}
+
+/** The surface normal at a BUFFER pixel, in CORTAO's view space. */
+float3 CORTAOViewNormal(uint2 BufferPos)
+{
+	if (UseDepthNormals != 0u)
+	{
+		return CORTAODepthViewNormal(BufferPos);
+	}
+
+	const float3 Encoded = GBufferATexture.Load(int3(BufferPos, 0)).xyz;
+	float3 WorldNormal = Encoded * 2.0f - 1.0f;
+	const float LengthSquared = dot(WorldNormal, WorldNormal);
+	if (LengthSquared < 1e-6f)
+	{
+		// An unlit pixel has no normal: face the camera.
+		return float3(0.0f, 0.0f, 1.0f);
+	}
+	WorldNormal *= rsqrt(LengthSquared);
+	const float3 ViewNormal = mul(WorldNormal, (float3x3)View.TranslatedWorldToView);
+	return normalize(float3(ViewNormal.x, ViewNormal.y, -ViewNormal.z));
+}

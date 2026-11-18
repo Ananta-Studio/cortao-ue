@@ -1,0 +1,98 @@
+// CORTAO for Unreal Engine. Copyright (c) 2026 Ananta Studio. MIT License, see LICENSE.
+// This port's own temporal accumulation. CORTAO ships none -- it leaves its per-frame noise
+// to TAA/TSR -- so the AO buffer alone, and any image without a temporal anti-aliaser (Off, FXAA), shows it raw.
+// Reprojects last frame's result (camera motion through ClipToPrevClip, moving objects through the velocity buffer),
+// keeps it only where last frame's depth at that spot matches what this point's depth was then, and blends.
+
+#include "CORTAOCommon.ush"
+
+Texture2D<float> PackedData;     // R32_FLOAT holding CORTAO's uint bits
+Texture2D<float> InputAO;
+Texture2D<float> HistoryAO;
+Texture2D<float> HistoryPacked;  // the same, last frame
+Texture2D VelocityTexture;
+SamplerState LinearClampSampler;
+
+uint2 ViewSize;
+float HistoryWeight;
+float DepthTolerance;
+
+/**
+ * Where the depth test fails: 0 drop the history, 1 on foliage pixels, 2 everywhere -- keep it,
+ * clamped into the range of this frame's 3 x 3 neighbourhood (TAA's answer to disocclusion). Swaying blades 1-3 px wide
+ * fail the depth test nearly every frame, so without this their raw per-frame noise is all that is ever shown.
+ */
+uint ClampMode;
+
+RWTexture2D<float> OutputAO;
+
+[numthreads(8, 8, 1)]
+void CORTAOTemporalCS(uint2 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (any(DispatchThreadId >= ViewSize))
+	{
+		return;
+	}
+
+	const uint Packed = asuint(PackedData.Load(int3(DispatchThreadId, 0)));
+	if (Packed == 0u)
+	{
+		// Sky: CORTAO left it unwritten; keep the history open too.
+		OutputAO[DispatchThreadId] = 1.0f;
+		return;
+	}
+
+	const float Current = InputAO.Load(int3(DispatchThreadId, 0));
+	const int2 BufferPos = int2(DispatchThreadId + ViewRectMin);
+	const float DeviceZ = SceneDepthTexture.Load(int3(BufferPos, 0));
+	const float LinearDepth = asfloat(Packed); // the low mantissa bits hold the normal: close enough
+
+	const float2 UV = (float2(DispatchThreadId) + 0.5f) / float2(ViewSize);
+	const float2 ScreenPos = float2(UV.x * 2.0f - 1.0f, 1.0f - UV.y * 2.0f);
+
+	// Camera motion; the result's w is (previous view depth / this view depth).
+	const float4 PrevClip = mul(float4(ScreenPos, DeviceZ, 1.0f), View.ClipToPrevClip);
+	float2 PrevScreen = PrevClip.xy / PrevClip.w;
+	const float ExpectedPrevDepth = PrevClip.w * LinearDepth;
+
+	// A moving object wrote its own motion.
+	const float4 EncodedVelocity = VelocityTexture.Load(int3(BufferPos, 0));
+	if (EncodedVelocity.x > 0.0f)
+	{
+		PrevScreen = ScreenPos - DecodeVelocityFromTexture(EncodedVelocity).xy;
+	}
+
+	const float2 PrevUV = float2(PrevScreen.x * 0.5f + 0.5f, 0.5f - PrevScreen.y * 0.5f);
+
+	float Weight = 0.0f;
+	float History = Current;
+	if (all(PrevUV > 0.0f) && all(PrevUV < 1.0f))
+	{
+		const uint PrevPacked = asuint(HistoryPacked.Load(int3(int2(PrevUV * float2(ViewSize)), 0)));
+		const float PrevDepth = asfloat(PrevPacked);
+		if (PrevPacked != 0u && abs(PrevDepth - ExpectedPrevDepth) < DepthTolerance * ExpectedPrevDepth)
+		{
+			Weight = HistoryWeight;
+			History = HistoryAO.SampleLevel(LinearClampSampler, PrevUV, 0);
+		}
+		else if (PrevPacked != 0u && (ClampMode == 2u || (ClampMode == 1u && CORTAOIsFoliage(Packed))))
+		{
+			float Lo = Current;
+			float Hi = Current;
+			UNROLL for (int Y = -1; Y <= 1; ++Y)
+			{
+				UNROLL for (int X = -1; X <= 1; ++X)
+				{
+					const int2 P = clamp(int2(DispatchThreadId) + int2(X, Y), int2(0, 0), int2(ViewSize) - 1);
+					const float V = InputAO.Load(int3(P, 0));
+					Lo = min(Lo, V);
+					Hi = max(Hi, V);
+				}
+			}
+			Weight = HistoryWeight;
+			History = clamp(HistoryAO.SampleLevel(LinearClampSampler, PrevUV, 0), Lo, Hi);
+		}
+	}
+
+	OutputAO[DispatchThreadId] = lerp(Current, History, Weight);
+}

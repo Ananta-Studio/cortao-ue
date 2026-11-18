@@ -1,0 +1,35 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0.0",
+	"FriendlyName": "CORTAO Ambient Occlusion",
+	"Description": "Circular Occluder Ray-Traced Ambient Occlusion (CORTAO, by Daniel Isheden, MIT) in place of the engine's screen space ambient occlusion, without an engine fork. Runs on the global illumination plugin hook (Global Illumination method: Plugin) and writes the engine's ScreenSpaceAO texture. Switch it on with r.CORTAO 1; see the README for what it needs.",
+	"Category": "Rendering",
+	"CreatedBy": "Ananta Studio",
+	"CreatedByURL": "https://github.com/Ananta-Studio",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"EngineVersion": "5.8.0",
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "CORTAO",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit",
+			"PlatformAllowList": [
+				"Win64"
+			]
+		},
+		{
+			"Name": "CORTAOFoliage",
+			"Type": "Runtime",
+			"LoadingPhase": "Default",
+			"PlatformAllowList": [
+				"Win64"
+			]
+		}
+	]
+}

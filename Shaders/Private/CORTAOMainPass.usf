@@ -1,0 +1,160 @@
+// CORTAO for Unreal Engine. Copyright (c) 2026 Ananta Studio. MIT License, see LICENSE.
+// CORTAO main pass -- traces the occluders and writes occlusion (1 = open).
+// CORTAO_SAMPLE_COUNT comes from the permutation (4..32).
+
+#include "CORTAOCommon.ush"
+
+
+/**
+ * The packed buffer as R32_FLOAT (the SM 6.7 workaround CORTAO's README describes): the bits are CORTAO's uint, read back with
+ * asuint, so the hardware's point SampleLevel / Gather can be used -- integer sampling needs SM 6.7, which UE 5.8 does not
+ * compile for. Every value is a normal float (a positive linear depth with the normal in its low mantissa bits) or 0
+ * for the sky, so no denormal flushing can touch it.
+ */
+Texture2D<float> PackedData;
+SamplerState PointBorderSampler; // point, point mips, border 0
+uint2 PackedSize;
+uint MipCount;
+
+/** 24 x 24 x 16 entries, x fastest (the R16_UINT table for 16 rays, widened to uint). */
+StructuredBuffer<uint> OccluderTable;
+
+uint PackedResolution;
+uint RandomSeed;
+float NormalBias;
+float Radius;
+float4 UnprojectParams;
+float4 ProjectionParams;
+float MaxApparentCircleRadiusCoefficient;
+float MipBias;
+float InverseMaxSlopeCompensation;
+float BackfaceThreshold;
+float BackfaceBoost;
+
+RWTexture2D<float> OutputAO;
+
+/**
+ * Foliage (stylised grass and leaves come out dark and stippled without this). CORTAO models every depth sample as an opaque disc
+ * standing for its whole share of the sampling circle, and judges the hemisphere by the SHADING normal. Stylised grass
+ * and leaf cards light their flat, two-sided blades with made-up normals (pointing up, or out of a sphere), so a blade's
+ * own pixels lie inside its hemisphere and occlude it, and its occluders are enlarged as if seen edge-on. The hooks:
+ *
+ *   PlaneRejectMode     0 off, 1 foliage receivers, 2 every receiver: an occluder must also lie above the receiver's
+ *                       GEOMETRIC plane (from depth) by PlaneRejectThreshold (sine of the angle) -- a flat blade never
+ *                       occludes itself.
+ *   FoliageSelfRadius   cm; a foliage receiver ignores foliage occluders nearer than this (its own clump; the painted
+ *                       root-to-tip gradient already shades it). 0 off.
+ *   FoliageOccluderScale  radius scale of a foliage occluder (sqrt of its opacity: blades and leaves have gaps and let
+ *                       light through). 1 off.
+ *   FoliageSlope        0: no slope compensation for foliage occluders (their normal is not their geometry), 1: as CORTAO.
+ */
+uint PlaneRejectMode;
+float PlaneRejectThreshold;
+float FoliageSelfRadius;
+float FoliageOccluderScale;
+uint FoliageSlope;
+
+static bool GReceiverFoliage = false;
+static float3 GReceiverGeometricNormal = float3(0.0f, 0.0f, 1.0f);
+static bool GReceiverPlaneReject = false;
+
+bool CORTAOAcceptOccluder(float3 DPos, float LengthSquared, uint Packed)
+{
+	const bool bOccluderFoliage = CORTAOIsFoliage(Packed);
+	if (GReceiverFoliage && bOccluderFoliage && LengthSquared < FoliageSelfRadius * FoliageSelfRadius)
+	{
+		return false;
+	}
+	if (GReceiverPlaneReject && dot(DPos, GReceiverGeometricNormal) < PlaneRejectThreshold * sqrt(LengthSquared))
+	{
+		return false;
+	}
+	return true;
+}
+
+float CORTAOSlopeCompensationHook(float SlopeCompensation, uint Packed)
+{
+	return (FoliageSlope == 0u && CORTAOIsFoliage(Packed)) ? 1.0f : SlopeCompensation;
+}
+
+float CORTAOOccluderRadiusScale(uint Packed)
+{
+	return CORTAOIsFoliage(Packed) ? FoliageOccluderScale : 1.0f;
+}
+
+#define CORTAO_ACCEPT_OCCLUDER(DPos, LengthSquared, Packed) CORTAOAcceptOccluder(DPos, LengthSquared, Packed)
+#define CORTAO_SLOPE_COMPENSATION_HOOK(Slope, Packed) CORTAOSlopeCompensationHook(Slope, Packed)
+#define CORTAO_OCCLUDER_RADIUS_SCALE_HOOK(Packed) CORTAOOccluderRadiusScale(Packed)
+
+#define CORTAO_HLSL 1
+#define CORTAO_PERSPECTIVE_PROJECTION 1
+#define CORTAO_16_BIT 0
+#define CORTAO_RAY_COUNT 16
+#define CORTAO_OCCLUDER_LOOKUP_TABLE 1
+#include "/Plugin/CORTAO/Private/ThirdParty/CORTAOMainPass.ush"
+
+
+cortao_half3 cortao_loadNormal(cortao_int2 PixelCoords)
+{
+	// Called once per pixel, at the start: the receiver's foliage flag and geometric plane for the hooks above.
+	const uint2 BufferPos = uint2(PixelCoords) + ViewRectMin;
+	GReceiverFoliage = CORTAOIsFoliage(asuint(PackedData.Load(int3(PixelCoords, 0))));
+	GReceiverPlaneReject = PlaneRejectMode == 2u || (PlaneRejectMode == 1u && GReceiverFoliage);
+	if (GReceiverPlaneReject)
+	{
+		GReceiverGeometricNormal = CORTAODepthViewNormal(BufferPos);
+	}
+	return CORTAOViewNormal(BufferPos);
+}
+
+cortao_uint cortao_samplePackedData(cortao_float2 TexCoords, cortao_float Mipmap)
+{
+	// The sampler CORTAO asks for: nearest mip, nearest texel, border 0.
+	return asuint(PackedData.SampleLevel(PointBorderSampler, TexCoords, Mipmap));
+}
+
+cortao_uint cortao_sampleOccluderLookupTable(cortao_float3 TexCoords)
+{
+	// Nearest, clamped.
+	const float3 Scaled = TexCoords * float3(24.0f, 24.0f, 16.0f);
+	const int3 Texel = clamp(int3(floor(Scaled)), int3(0, 0, 0), int3(23, 23, 15));
+	return OccluderTable[Texel.x + 24 * (Texel.y + 24 * Texel.z)];
+}
+
+void cortao_writeResult(cortao_int2 PixelCoords, cortao_half Occlusion, cortao_half3 BentNormal, cortao_half3x3 TangentSpaceTransform, cortao_uint RayBits)
+{
+	OutputAO[PixelCoords] = Occlusion;
+}
+
+uint2 CORTAODeinterleave(uint Index)
+{
+	uint2 P = uint2(Index, Index) >> uint2(0, 1);
+	P &= 0x5555u;
+	P = (P ^ (P >> 1u)) & 0x3333u;
+	P = (P ^ (P >> 2u)) & 0x0f0fu;
+	P = (P ^ (P >> 4u)) & 0x00ffu;
+	return P;
+}
+
+[numthreads(16, 16, 1)]
+void CORTAOMainCS(uint2 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	CORTAOMainPassParameters Params;
+	Params.packedResolution = PackedResolution;
+	Params.randomSeed = RandomSeed;
+	Params.normalBias = NormalBias;
+	Params.radius = Radius;
+	Params.unprojectParams = UnprojectParams;
+	Params.projectionParams = ProjectionParams;
+	Params.maxApparentCircleRadiusCoefficient = MaxApparentCircleRadiusCoefficient;
+	Params.mipBias = MipBias;
+	Params.inverseMaxSlopeCompensation = InverseMaxSlopeCompensation;
+	Params.backfaceThreshold = BackfaceThreshold;
+	Params.backfaceBoost = BackfaceBoost;
+	Params._padding0 = 0u;
+	Params._padding1 = 0u;
+	Params._padding2 = 0u;
+
+	const uint2 PixelCoords = GroupId * uint2(16, 16) + CORTAODeinterleave(GroupIndex);
+	cortao_mainPass(PixelCoords, Params);
+}

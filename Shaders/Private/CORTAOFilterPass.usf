@@ -1,0 +1,48 @@
+// CORTAO for Unreal Engine. Copyright (c) 2026 Ananta Studio. MIT License, see LICENSE.
+// CORTAO filter pass -- a sparse depth/normal-aware blur ahead of the temporal passes (this port's own, TSR, DLSS).
+// CORTAO_LARGE_FILTER comes from the permutation.
+
+#include "CORTAOCommon.ush"
+
+#define CORTAO_HLSL 1
+#define CORTAO_16_BIT 0
+#define CORTAO_FILTER_SYMMETRY 1
+#include "/Plugin/CORTAO/Private/ThirdParty/CORTAOFilterPass.ush"
+
+// R32_FLOAT holding CORTAO's uint bits (see CORTAOMainPass.usf), gathered by the hardware and read with asuint.
+Texture2D<float> PackedData;
+Texture2D<float> InputAO;
+SamplerState PointBorderSampler; // point, border 0
+uint2 PackedSize;
+
+uint PackedResolution;
+float DepthSensitivity;
+float NormalSensitivity;
+
+RWTexture2D<float> OutputAO;
+
+cortao_uint4 cortao_gatherPackedData(cortao_float2 TexCoords, cortao_int2 Offset)
+{
+	return asuint(PackedData.GatherRed(PointBorderSampler, TexCoords, Offset));
+}
+
+cortao_half4 cortao_gatherSSAO(cortao_float2 TexCoords, cortao_int2 Offset)
+{
+	return InputAO.GatherRed(PointBorderSampler, TexCoords, Offset);
+}
+
+void cortao_writeFilterOutput(cortao_int2 PixelCoords, cortao_half Ssao)
+{
+	OutputAO[PixelCoords] = Ssao;
+}
+
+[numthreads(8, 8, 1)]
+void CORTAOFilterCS(uint2 DispatchThreadId : SV_DispatchThreadID)
+{
+	CORTAOFilterPassParameters Params;
+	Params.packedResolution = PackedResolution;
+	Params.depthSensitivity = DepthSensitivity;
+	Params.normalSensitivity = NormalSensitivity;
+	Params._padding0 = 0u;
+	cortao_filterPass(DispatchThreadId, Params);
+}

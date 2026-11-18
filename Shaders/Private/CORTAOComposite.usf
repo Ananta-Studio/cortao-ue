@@ -1,0 +1,38 @@
+// CORTAO for Unreal Engine. Copyright (c) 2026 Ananta Studio. MIT License, see LICENSE.
+// CORTAO's result into the engine's ScreenSpaceAO texture, shaped by strength and
+// power. Sky pixels (packed data 0: CORTAO never wrote them) are left open. Foliage pixels (the prepass's flag) take only
+// FoliageReceive of it (1 by default; lower it if a grass clump's thin blades still read as tiny dark pits).
+
+#include "CORTAOCommon.ush"
+
+Texture2D<float> PackedData; // R32_FLOAT holding CORTAO's uint bits
+Texture2D<float> InputAO;
+uint2 ViewSize;
+float Intensity;
+float Power;
+float FoliageReceive;
+uint FoliageDebug;   // 1: foliage pixels shown as 0.2 (black in the AO buffer view), the rest as CORTAO's result
+
+RWTexture2D<float> ScreenSpaceAOOutput;
+
+[numthreads(8, 8, 1)]
+void CORTAOCompositeCS(uint2 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (any(DispatchThreadId >= ViewSize))
+	{
+		return;
+	}
+
+	float AO = 1.0f;
+	const uint Packed = asuint(PackedData.Load(int3(DispatchThreadId, 0)));
+	if (Packed != 0u)
+	{
+		const float Raw = saturate(InputAO.Load(int3(DispatchThreadId, 0)));
+		AO = lerp(1.0f, pow(max(Raw, 1e-4f), Power), Intensity);
+		if (CORTAOIsFoliage(Packed))   // the prepass's flag: Two Sided Foliage, or the foliage lighting channel
+		{
+			AO = FoliageDebug != 0u ? 0.2f : lerp(1.0f, AO, FoliageReceive);
+		}
+	}
+	ScreenSpaceAOOutput[DispatchThreadId + ViewRectMin] = AO;
+}

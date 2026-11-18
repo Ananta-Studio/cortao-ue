@@ -1,0 +1,22 @@
+# Unreal Engine plugin build output
+/Binaries/
+/Intermediate/
+/Saved/
+/DerivedDataCache/
+
+# IDE and OS files
+.vs/
+.vscode/
+.idea/
+*.sln
+*.suo
+*.user
+*.VC.db
+*.opensdf
+*.sdf
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc

@@ -1,0 +1,11 @@
+# Text is stored and checked out with LF, as upstream CORTAO's shaders are.
+* text=auto eol=lf
+
+*.usf text eol=lf
+*.ush text eol=lf
+*.inl text eol=lf
+*.cs  text eol=lf
+*.cpp text eol=lf
+*.h   text eol=lf
+*.png binary
+*.jpg binary

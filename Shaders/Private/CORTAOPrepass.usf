@@ -1,0 +1,103 @@
+// CORTAO for Unreal Engine. Copyright (c) 2026 Ananta Studio. MIT License, see LICENSE.
+// CORTAO prepass -- linear depth and a packed normal into an R32_UINT mip chain, plus the foliage flag.
+
+#include "CORTAOCommon.ush"
+
+#define CORTAO_HLSL 1
+#define CORTAO_PERSPECTIVE_PROJECTION 1
+#include "/Plugin/CORTAO/Private/ThirdParty/CORTAOPrepass.ush"
+
+Texture2D GBufferBTexture;            // .a: the shading model id in its low 4 bits
+Texture2D<uint> LightingChannelsTexture; // the engine's copy of the stencil's lighting channels (bit n = channel n)
+uint FoliageChannelMask;              // channels that mark foliage (0: none)
+/**
+ * Foliage without a marker: a pixel whose shading normal is this far from its geometric normal (|cos| below
+ * the value) counts as foliage. Stylised grass and leaf cards light flat, upright blades with normals pointing up or
+ * out of a sphere; real surfaces, normal-mapped ones included, stay within ~60 degrees. 0: off.
+ */
+float FoliageMismatch;
+
+uint PackedResolution;
+float DepthScale;
+float DepthOffset;
+uint RandomSeed;
+uint MipCount;
+
+// R32_FLOAT holding CORTAO's uint bits (see CORTAOMainPass.usf): written with asfloat.
+RWTexture2D<float> PackedMip0;
+RWTexture2D<float> PackedMip1;
+RWTexture2D<float> PackedMip2;
+RWTexture2D<float> PackedMip3;
+RWTexture2D<float> PackedMip4;
+RWTexture2D<float> PackedMip5;
+RWTexture2D<float> PackedMip6;
+RWTexture2D<float> PackedMip7;
+
+cortao_float cortao_loadDepth(cortao_int2 PixelCoords)
+{
+	return SceneDepthTexture.Load(int3(PixelCoords + int2(ViewRectMin), 0));
+}
+
+cortao_float3 cortao_loadNormal(cortao_int2 PixelCoords)
+{
+	return CORTAOViewNormal(uint2(PixelCoords) + ViewRectMin);
+}
+
+static uint GCORTAOPackedMip0 = 0u;
+
+void cortao_writePackedData(cortao_int2 PixelCoords, cortao_int MipLevel, cortao_uint Data)
+{
+	// The foliage flag (CORTAOCommon.ush) rides in every mip; the sky (0) stays 0.
+	if (MipLevel == 0 && Data != 0u)
+	{
+		const uint2 BufferPos = uint2(PixelCoords) + ViewRectMin;
+		const uint ShadingModel = ((uint)round(GBufferBTexture.Load(int3(BufferPos, 0)).a * 255.0f)) & 0xF;
+		bool bFoliage = ShadingModel == CORTAO_SHADINGMODELID_TWOSIDED_FOLIAGE
+			|| (FoliageChannelMask != 0u && (LightingChannelsTexture.Load(int3(BufferPos, 0)) & FoliageChannelMask) != 0u);
+		if (!bFoliage && FoliageMismatch > 0.0f)
+		{
+			const float3 Shading = GBufferATexture.Load(int3(BufferPos, 0)).xyz * 2.0f - 1.0f;
+			const float LengthSquared = dot(Shading, Shading);
+			if (LengthSquared > 1e-6f)
+			{
+				const float3 Geometric = CORTAODepthWorldNormal(int2(BufferPos));
+				bFoliage = abs(dot(Shading * rsqrt(LengthSquared), Geometric)) < FoliageMismatch;
+			}
+		}
+		Data = bFoliage ? (Data | CORTAO_FOLIAGE_BIT) : (Data & ~CORTAO_FOLIAGE_BIT);
+		GCORTAOPackedMip0 = Data;
+	}
+	else if (MipLevel > 0 && Data != 0u)
+	{
+		Data = GCORTAOPackedMip0;   // CORTAO hands every mip the same value it wrote to mip 0
+	}
+
+	// MipLevel is a constant in CORTAO's unrolled loop; a resource cannot be indexed dynamically.
+	const float Bits = asfloat(Data);
+	switch (MipLevel)
+	{
+		case 0: PackedMip0[PixelCoords] = Bits; break;
+		case 1: PackedMip1[PixelCoords] = Bits; break;
+		case 2: PackedMip2[PixelCoords] = Bits; break;
+		case 3: PackedMip3[PixelCoords] = Bits; break;
+		case 4: PackedMip4[PixelCoords] = Bits; break;
+		case 5: PackedMip5[PixelCoords] = Bits; break;
+		case 6: PackedMip6[PixelCoords] = Bits; break;
+		default: PackedMip7[PixelCoords] = Bits; break;
+	}
+}
+
+[numthreads(8, 8, 1)]
+void CORTAOPrepassCS(uint2 DispatchThreadId : SV_DispatchThreadID)
+{
+	CORTAOPrepassParameters Params;
+	Params.packedResolution = PackedResolution;
+	Params.depthScale = DepthScale;
+	Params.depthOffset = DepthOffset;
+	Params.randomSeed = RandomSeed;
+	Params.mipCount = MipCount;
+	Params._padding0 = 0u;
+	Params._padding1 = 0u;
+	Params._padding2 = 0u;
+	cortao_prepass(DispatchThreadId, Params);
+}
